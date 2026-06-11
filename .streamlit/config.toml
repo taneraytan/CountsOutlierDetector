@@ -1,0 +1,14 @@
+# Security-relevant server defaults for the Studio app.
+#
+# Streamlit listens on ALL network interfaces by default. This app has no
+# authentication and stores every uploaded dataset locally, so we bind to
+# loopback only. If you intentionally want LAN access, change the address —
+# but put the app behind a reverse proxy with authentication first.
+
+[server]
+address = "127.0.0.1"
+maxUploadSize = 200
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -64,10 +63,10 @@ def apply_preprocessing(df: pd.DataFrame, cfg: PreprocessConfig) -> tuple[pd.Dat
     df = df.copy()
 
     if cfg.drop_columns:
-        keep = [c for c in cfg.drop_columns if c in df.columns]
-        if keep:
-            df = df.drop(columns=keep)
-            log.append(f"Dropped {len(keep)} user-selected columns: {keep}")
+        to_drop = [c for c in cfg.drop_columns if c in df.columns]
+        if to_drop:
+            df = df.drop(columns=to_drop)
+            log.append(f"Dropped {len(to_drop)} user-selected columns: {to_drop}")
 
     if cfg.drop_duplicates:
         before = len(df)
@@ -247,6 +246,23 @@ def apply_feature_engineering(df: pd.DataFrame,
             log.append(f"ratio {a} / {b}")
 
     return df, log
+
+
+def encode_for_model(df: pd.DataFrame) -> pd.DataFrame:
+    """Encode a frame numerically for sklearn estimators (baseline cross-check).
+
+    Numeric columns are median-imputed; everything else is ordinal-encoded
+    from its string representation.
+    """
+    out = pd.DataFrame(index=df.index)
+    for c in df.columns:
+        col = df[c]
+        if is_numeric_dtype(col):
+            filled = col.fillna(col.median())
+            out[c] = filled.fillna(0)
+        else:
+            out[c] = pd.Categorical(col.astype(str)).codes
+    return out
 
 
 # ---------------------------------------------------------------------------

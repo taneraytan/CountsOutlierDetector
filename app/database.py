@@ -18,7 +18,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -29,6 +29,8 @@ DEFAULT_DB_PATH = Path(os.environ.get(
     "COUNTS_DB_PATH",
     Path.home() / ".counts_outlier_detector" / "data.db",
 ))
+
+SCHEMA_VERSION = 1
 
 
 SCHEMA = """
@@ -68,11 +70,22 @@ CREATE INDEX IF NOT EXISTS idx_runs_dataset ON runs(dataset_id);
 # Connection management
 # ---------------------------------------------------------------------------
 
+def _restrict_permissions(p: Path) -> None:
+    """Best-effort: keep the database readable only by the current user."""
+    try:
+        os.chmod(p.parent, 0o700)
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+
+
 def init_db(path: Path | str = DEFAULT_DB_PATH) -> Path:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(p) as conn:
         conn.executescript(SCHEMA)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    _restrict_permissions(p)
     return p
 
 
@@ -81,6 +94,7 @@ def connect(path: Path | str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
     p = init_db(path)
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
@@ -132,10 +146,11 @@ def save_dataset(df: pd.DataFrame, name: str,
                 len(df),
                 df.shape[1],
                 json.dumps(list(df.columns.astype(str))),
-                datetime.utcnow().isoformat(timespec="seconds"),
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 _df_to_parquet_bytes(df),
             ),
         )
+        assert cursor.lastrowid is not None
         return int(cursor.lastrowid)
 
 
@@ -182,13 +197,14 @@ def save_run(dataset_id: int, label: str, params: dict, summary: dict,
             (
                 dataset_id,
                 label,
-                datetime.utcnow().isoformat(timespec="seconds"),
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 json.dumps(params, default=str),
                 json.dumps(summary, default=str),
                 n_flagged,
                 run_summary,
             ),
         )
+        assert cursor.lastrowid is not None
         run_id = int(cursor.lastrowid)
         conn.execute(
             "INSERT INTO run_results (run_id, parquet) VALUES (?, ?)",
@@ -245,3 +261,26 @@ def delete_run(run_id: int, path: Path | str = DEFAULT_DB_PATH) -> None:
     with connect(path) as conn:
         conn.execute("DELETE FROM run_results WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+
+
+# ---------------------------------------------------------------------------
+# Maintenance
+# ---------------------------------------------------------------------------
+
+def vacuum(path: Path | str = DEFAULT_DB_PATH) -> None:
+    """Reclaim free pages so deleted data no longer lingers in the file."""
+    p = init_db(path)
+    conn = sqlite3.connect(p)
+    try:
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+
+def purge_all(path: Path | str = DEFAULT_DB_PATH) -> None:
+    """Delete every dataset, run and result, then vacuum the database file."""
+    with connect(path) as conn:
+        conn.execute("DELETE FROM run_results")
+        conn.execute("DELETE FROM runs")
+        conn.execute("DELETE FROM datasets")
+    vacuum(path)
