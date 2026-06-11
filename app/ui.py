@@ -7,12 +7,13 @@ Run with:
 
 from __future__ import annotations
 
-import io
+import html
 import sys
 import traceback
 from pathlib import Path
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -22,15 +23,23 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import database as db
-from app.io_utils import SUPPORTED_EXTENSIONS, export_dataframe, load_dataframe
+from app.demo import generate_demo_dataset
+from app.io_utils import (
+    SUPPORTED_EXTENSIONS,
+    export_dataframe,
+    load_dataframe,
+    safe_filename,
+)
 from app.preprocessing import (
     FeatureEngineeringConfig,
     PreprocessConfig,
     apply_feature_engineering,
     apply_preprocessing,
     column_summary,
+    encode_for_model,
     suggest_datetime_columns,
 )
+from app.report import build_html_report, format_explanation_items
 from counts_outlier_detector import CountsOutlierDetector
 
 
@@ -79,6 +88,25 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
+# Cached catalogue lookups (cleared whenever the database is written)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def _datasets_catalogue() -> pd.DataFrame:
+    return db.list_datasets()
+
+
+@st.cache_data(show_spinner=False)
+def _runs_catalogue() -> pd.DataFrame:
+    return db.list_runs()
+
+
+def _invalidate_catalogues() -> None:
+    _datasets_catalogue.clear()
+    _runs_catalogue.clear()
+
+
+# ---------------------------------------------------------------------------
 # Session-state helpers
 # ---------------------------------------------------------------------------
 
@@ -91,17 +119,35 @@ _ss_default("raw_df", None)
 _ss_default("raw_filename", None)
 _ss_default("processed_df", None)
 _ss_default("processing_log", [])
-_ss_default("selected_features", None)
 _ss_default("last_results", None)
 _ss_default("last_run_id", None)
+_ss_default("persist_ok", True)
+_ss_default("sweep_df", None)
+_ss_default("report_html", None)
+
+
+def _reset_for_new_data() -> None:
+    st.session_state.processed_df = None
+    st.session_state.last_results = None
+    st.session_state.report_html = None
+    st.session_state.sweep_df = None
+    st.session_state.pop("feature_select", None)
 
 
 def _metric_card(label: str, value: str) -> None:
     st.markdown(
-        f"<div class='metric-card'><div class='label'>{label}</div>"
-        f"<div class='value'>{value}</div></div>",
+        f"<div class='metric-card'><div class='label'>{html.escape(label)}</div>"
+        f"<div class='value'>{html.escape(value)}</div></div>",
         unsafe_allow_html=True,
     )
+
+
+def _flag_array(results_df: pd.DataFrame) -> np.ndarray:
+    """Boolean per-row flagged status from a stored run-results frame."""
+    for col in ("TOTAL SCORE", "TOTAL_SCORE"):
+        if col in results_df.columns:
+            return (pd.to_numeric(results_df[col], errors="coerce").fillna(0) > 0).to_numpy()
+    return np.zeros(len(results_df), dtype=bool)
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +161,10 @@ def page_home():
     cols = st.columns(4)
     with cols[0]:
         _metric_card("Datasets stored",
-                     str(len(db.list_datasets())))
+                     str(len(_datasets_catalogue())))
     with cols[1]:
         _metric_card("Analyses saved",
-                     str(len(db.list_runs())))
+                     str(len(_runs_catalogue())))
     with cols[2]:
         df = st.session_state.raw_df
         _metric_card("Loaded rows", f"{len(df):,}" if df is not None else "—")
@@ -131,16 +177,16 @@ def page_home():
     st.markdown(
         """
         ### How it works
-        1. **Load Data** — upload a CSV / TXT / Excel / Parquet file or pick a previously-stored
-           dataset from the local database.
+        1. **Load Data** — upload a CSV / TXT / Excel / Parquet file, pick a previously-stored
+           dataset from the local database, or load the built-in demo dataset.
         2. **Preprocess** — handle missing values, drop or clip outliers, optionally scale or
            encode categoricals.
         3. **Feature Engineering** — expand datetimes, add log/sqrt transforms, generate
            interactions or ratios.
         4. **Configure & Run** — pick which features to feed the detector, tune parameters,
-           and execute the analysis.
-        5. **Results** — explore flagged rows, download exports, and revisit previous runs from
-           the local database.
+           and execute the analysis (optionally with an IsolationForest cross-check).
+        5. **Results** — explore flagged rows and their explanations, download exports or a
+           self-contained HTML report, and revisit previous runs from the local database.
 
         The detector flags rows whose values (or combinations of values across 2–6 columns) are
         substantially rarer than what would be expected under a uniform distribution.
@@ -153,9 +199,9 @@ def page_home():
 
 def page_load_data():
     st.header("1 · Load Data", anchor=False)
-    st.caption("Upload a file or pick a dataset stored locally.")
+    st.caption("Upload a file, pick a dataset stored locally, or try the demo dataset.")
 
-    tabs = st.tabs(["Upload file", "From local database"])
+    tabs = st.tabs(["Upload file", "From local database", "Demo dataset"])
 
     with tabs[0]:
         ext_help = ", ".join(sorted(e.lstrip(".") for e in SUPPORTED_EXTENSIONS))
@@ -171,7 +217,9 @@ def page_load_data():
         encoding = col_b.text_input("Encoding", value="utf-8")
         save_to_db = st.checkbox(
             "Save to local database after loading", value=True,
-            help="The dataset is de-duplicated by content hash.",
+            help="The dataset is de-duplicated by content hash. If unchecked, the "
+                 "dataset stays in memory only and the app will not persist it later "
+                 "without asking.",
         )
 
         if uploaded is not None and st.button("Load file", type="primary"):
@@ -185,19 +233,20 @@ def page_load_data():
                 return
             st.session_state.raw_df = df
             st.session_state.raw_filename = uploaded.name
-            st.session_state.processed_df = None
-            st.session_state.selected_features = None
+            st.session_state.persist_ok = bool(save_to_db)
+            _reset_for_new_data()
             if save_to_db:
                 try:
                     ds_id = db.save_dataset(df, uploaded.name)
+                    _invalidate_catalogues()
                     st.success(f"Loaded {len(df):,} rows · saved as dataset id {ds_id}")
                 except Exception as exc:
                     st.warning(f"Loaded but failed to persist to DB: {exc}")
             else:
-                st.success(f"Loaded {len(df):,} rows")
+                st.success(f"Loaded {len(df):,} rows (kept in memory only)")
 
     with tabs[1]:
-        catalogue = db.list_datasets()
+        catalogue = _datasets_catalogue()
         if catalogue.empty:
             st.info("No datasets saved yet — upload one in the other tab.")
         else:
@@ -215,13 +264,35 @@ def page_load_data():
                 st.session_state.raw_filename = catalogue.loc[
                     catalogue['id'] == picked, 'name'
                 ].iloc[0]
-                st.session_state.processed_df = None
-                st.session_state.selected_features = None
+                st.session_state.persist_ok = True
+                _reset_for_new_data()
                 st.success(f"Loaded {len(df):,} rows from dataset id {picked}")
-            if col_d.button("Delete selected", help="Removes the dataset and any saved runs."):
-                db.delete_dataset(int(picked))
-                st.success(f"Deleted dataset {picked}")
-                st.rerun()
+            with col_d:
+                confirm_ds = st.checkbox(
+                    "Confirm deletion", key="confirm_ds_delete",
+                    help="Removes the dataset and any saved runs.",
+                )
+                if st.button("Delete selected", disabled=not confirm_ds):
+                    db.delete_dataset(int(picked))
+                    _invalidate_catalogues()
+                    st.success(f"Deleted dataset {picked}")
+                    st.rerun()
+
+    with tabs[2]:
+        st.markdown(
+            "A synthetic HR-style dataset with **planted outliers**: two employees in a "
+            "department/region combination that never occurs naturally, and one with an "
+            "extreme salary. Useful for getting a feel for the workflow and for verifying "
+            "parameter changes."
+        )
+        if st.button("Load demo dataset", type="primary"):
+            df = generate_demo_dataset()
+            st.session_state.raw_df = df
+            st.session_state.raw_filename = "demo_dataset.csv"
+            st.session_state.persist_ok = True
+            _reset_for_new_data()
+            st.success(f"Loaded demo dataset ({len(df):,} rows). The planted outliers "
+                       "are in the last three rows.")
 
     df = st.session_state.raw_df
     if df is None:
@@ -306,7 +377,7 @@ def page_preprocess():
             return
         st.session_state.processed_df = new_df
         st.session_state.processing_log = log
-        st.session_state.selected_features = None
+        st.session_state.pop("feature_select", None)
         st.success(f"Preprocessing applied — {new_df.shape[0]:,} rows × {new_df.shape[1]:,} columns")
 
     if st.session_state.processed_df is not None:
@@ -386,7 +457,7 @@ def page_feature_engineering():
             return
         st.session_state.processed_df = new_df
         st.session_state.processing_log = (st.session_state.processing_log or []) + log
-        st.session_state.selected_features = None
+        st.session_state.pop("feature_select", None)
         st.success(
             f"{len(log)} feature operation(s) applied · now "
             f"{new_df.shape[1]:,} column(s)."
@@ -410,31 +481,34 @@ def page_configure_run():
 
     st.caption("Pick which features the detector should consider.")
     all_cols = df.columns.tolist()
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
 
-    default_selection = (
-        st.session_state.selected_features
-        if st.session_state.selected_features
-        else all_cols
-    )
+    # Keyed widget so the quick-select buttons below can drive it via callbacks.
+    if "feature_select" not in st.session_state:
+        st.session_state.feature_select = all_cols
+    else:
+        st.session_state.feature_select = [
+            c for c in st.session_state.feature_select if c in all_cols
+        ]
     selected = st.multiselect(
         "Features to include in the analysis",
         all_cols,
-        default=[c for c in default_selection if c in all_cols],
+        key="feature_select",
     )
-    col_a, col_b, col_c = st.columns(3)
-    if col_a.button("Select all"):
-        selected = all_cols
-        st.session_state.selected_features = all_cols
-        st.rerun()
-    if col_b.button("Numeric only"):
-        selected = df.select_dtypes(include="number").columns.tolist()
-        st.session_state.selected_features = selected
-        st.rerun()
-    if col_c.button("Clear"):
-        st.session_state.selected_features = []
-        st.rerun()
 
-    st.session_state.selected_features = selected
+    def _select_all():
+        st.session_state.feature_select = all_cols
+
+    def _select_numeric():
+        st.session_state.feature_select = numeric_cols
+
+    def _select_none():
+        st.session_state.feature_select = []
+
+    col_a, col_b, col_c = st.columns(3)
+    col_a.button("Select all", on_click=_select_all)
+    col_b.button("Numeric only", on_click=_select_numeric)
+    col_c.button("Clear", on_click=_select_none)
 
     st.markdown("---")
     st.subheader("Detector parameters")
@@ -453,15 +527,37 @@ def page_configure_run():
     max_combos = col6.number_input(
         "Max combinations to evaluate", 1_000, 10_000_000, 100_000, step=10_000,
     )
-    col7, col8 = st.columns(2)
+    col7, col8, col9 = st.columns(3)
     check_marginal = col7.checkbox(
         "Use marginal probabilities", value=False,
         help="Only flag combinations rare both in absolute terms and given marginal distributions.",
     )
     run_parallel = col8.checkbox("Run in parallel", value=False)
+    time_budget = col9.number_input(
+        "Time budget (seconds, 0 = unlimited)", 0, 86_400, 0,
+        help="The analysis stops ascending to higher dimensions once this wall-clock "
+             "budget is exhausted; results computed so far are kept.",
+    )
+
+    run_baseline = st.checkbox(
+        "Cross-check with IsolationForest baseline", value=False,
+        help="Runs sklearn's IsolationForest on the same features. Rows flagged by "
+             "both methods are high-confidence outliers.",
+    )
 
     label = st.text_input("Run label", value=f"Run @ {pd.Timestamp.now():%Y-%m-%d %H:%M}")
-    save_run = st.checkbox("Save run to local database", value=True)
+
+    persist_default = bool(st.session_state.persist_ok)
+    save_run = st.checkbox(
+        "Save run to local database (also stores the analysed dataset)",
+        value=persist_default,
+    )
+    if not persist_default:
+        st.caption(
+            ":warning: You chose **not** to persist this dataset when loading it. "
+            "Ticking the box above will store the analysed dataset in the local "
+            "database after all."
+        )
 
     if not selected:
         st.warning("Select at least one feature to continue.")
@@ -478,6 +574,7 @@ def page_configure_run():
             min_values_per_column=int(min_uv),
             max_values_per_column=int(max_uv),
             run_parallel=bool(run_parallel),
+            max_execution_seconds=int(time_budget) or None,
         )
         with st.spinner("Running detector — this may take a while for large feature sets…"):
             try:
@@ -491,8 +588,21 @@ def page_configure_run():
         flagged_only = results["Breakdown Flagged Rows"]
         summary_df = results["Flagged Summary"]
 
-        # Build a compact display dataframe joining original rows with scores
+        baseline_flags = None
+        if run_baseline:
+            try:
+                from sklearn.ensemble import IsolationForest
+
+                encoded = encode_for_model(sub)
+                iso = IsolationForest(random_state=0)
+                baseline_flags = pd.Series(
+                    iso.fit_predict(encoded) == -1, index=sub.index
+                )
+            except Exception as exc:
+                st.warning(f"IsolationForest baseline failed: {exc}")
+
         most = detector.get_most_flagged_rows()
+        st.session_state.report_html = None
         st.session_state.last_results = {
             "label": label,
             "input_df": sub,
@@ -501,6 +611,7 @@ def page_configure_run():
             "flagged_all": flagged_all,
             "flagged_only": flagged_only,
             "most_flagged": most,
+            "baseline_flags": baseline_flags,
             "run_summary": detector.run_summary or "",
             "params": {
                 "features": selected,
@@ -512,15 +623,20 @@ def page_configure_run():
                 "max_num_combinations": max_combos,
                 "check_marginal_probs": check_marginal,
                 "run_parallel": run_parallel,
+                "max_execution_seconds": int(time_budget) or None,
             },
         }
 
+        if detector.truncated:
+            st.warning("The time budget was reached — results are partial "
+                       "(see the detector summary on the Results page).")
+
         if save_run:
             try:
-                ds_id = db.save_dataset(
-                    df,
-                    name=st.session_state.raw_filename or "in_memory_dataset",
-                )
+                dataset_name = st.session_state.raw_filename or "in_memory_dataset"
+                if st.session_state.processed_df is not None:
+                    dataset_name = f"{dataset_name} [processed]"
+                ds_id = db.save_dataset(df, name=dataset_name)
                 run_id = db.save_run(
                     dataset_id=ds_id,
                     label=label,
@@ -531,12 +647,64 @@ def page_configure_run():
                     ),
                     run_summary=detector.run_summary or "",
                 )
+                _invalidate_catalogues()
                 st.session_state.last_run_id = run_id
                 st.success(f"Run complete · saved as run id {run_id}. Open the Results page.")
             except Exception as exc:
                 st.warning(f"Run completed but DB save failed: {exc}")
         else:
             st.success("Run complete. Open the Results page.")
+
+    st.markdown("---")
+    with st.expander("Threshold sweep (quick estimate)"):
+        st.caption(
+            "Runs the detector at several thresholds (capped at 2 dimensions and a "
+            "60-second budget per step) so you can pick a threshold empirically "
+            "instead of guessing."
+        )
+        if st.button("Run threshold sweep"):
+            sweep_rows = []
+            sweep_thresholds = [0.005, 0.01, 0.02, 0.05, 0.1, 0.25]
+            progress = st.progress(0.0)
+            for s_idx, t in enumerate(sweep_thresholds):
+                det = CountsOutlierDetector(
+                    n_bins=int(n_bins),
+                    max_dimensions=min(int(max_dim), 2),
+                    threshold=float(t),
+                    check_marginal_probs=bool(check_marginal),
+                    max_num_combinations=int(max_combos),
+                    min_values_per_column=int(min_uv),
+                    max_values_per_column=int(max_uv),
+                    max_execution_seconds=60,
+                )
+                try:
+                    res = det.fit_predict(df[selected].copy())
+                    s = res["Scores"]
+                    sweep_rows.append({
+                        "threshold": t,
+                        "flagged_pct": float((s > 0).mean() * 100),
+                    })
+                except Exception as exc:
+                    st.warning(f"Sweep failed at threshold {t}: {exc}")
+                    break
+                progress.progress((s_idx + 1) / len(sweep_thresholds))
+            if sweep_rows:
+                st.session_state.sweep_df = pd.DataFrame(sweep_rows)
+
+        sweep_df = st.session_state.sweep_df
+        if sweep_df is not None and not sweep_df.empty:
+            chart = (
+                alt.Chart(sweep_df)
+                .mark_line(point=True, color="#2d6cb0")
+                .encode(
+                    x=alt.X("threshold:Q", title="Rarity threshold",
+                            scale=alt.Scale(type="log")),
+                    y=alt.Y("flagged_pct:Q", title="Rows flagged (%)"),
+                    tooltip=["threshold", "flagged_pct"],
+                )
+                .properties(height=240)
+            )
+            st.altair_chart(chart, use_container_width=True)
 
 
 def _altair_score_distribution(scores: pd.Series) -> alt.Chart:
@@ -554,6 +722,104 @@ def _altair_score_distribution(scores: pd.Series) -> alt.Chart:
     )
 
 
+def _render_row_inspector(res: dict) -> None:
+    most = res["most_flagged"]
+    flagged_all = res["flagged_all"]
+    input_df = res["input_df"]
+    if most is None or most.empty or not isinstance(flagged_all, pd.DataFrame):
+        return
+
+    st.markdown("### Row inspector")
+    st.caption("Why was a particular row flagged?")
+
+    def _fmt(i):
+        try:
+            return f"Row {i} · score {int(most.loc[i, 'TOTAL SCORE'])}"
+        except Exception:
+            return f"Row {i}"
+
+    sel_row = st.selectbox("Pick a flagged row", most.index.tolist(),
+                           format_func=_fmt, key="inspect_row")
+
+    if isinstance(input_df, pd.DataFrame) and sel_row in input_df.index:
+        st.dataframe(input_df.loc[[sel_row]], use_container_width=True)
+
+    expl_lines: list[tuple[int, str, list, list]] = []
+    if sel_row in flagged_all.index:
+        for d in range(1, 7):
+            col = f"{d}d Explanations"
+            if col not in flagged_all.columns:
+                continue
+            cell = flagged_all.loc[sel_row, col]
+            for line in format_explanation_items(cell):
+                expl_lines.append((d, line, [], []))
+
+    if not expl_lines:
+        st.info("No stored explanations for this row.")
+        return
+
+    for d, line, _, _ in expl_lines:
+        st.markdown(f"- **{d}d** — {line}")
+
+    # For 2-D explanations over low-cardinality columns, show the contingency
+    # table so the rarity is visible in context.
+    if (isinstance(input_df, pd.DataFrame) and sel_row in flagged_all.index
+            and "2d Explanations" in flagged_all.columns):
+        cell = flagged_all.loc[sel_row, "2d Explanations"]
+        shown = 0
+        if not isinstance(cell, str) and cell is not None:
+            for item in list(cell):
+                if shown >= 2:
+                    break
+                try:
+                    cols, vals = list(item[0]), list(item[1])
+                except (TypeError, IndexError, KeyError):
+                    continue
+                if len(cols) != 2:
+                    continue
+                c1, c2 = str(cols[0]), str(cols[1])
+                if c1 not in input_df.columns or c2 not in input_df.columns:
+                    continue
+                if input_df[c1].nunique() > 25 or input_df[c2].nunique() > 25:
+                    continue
+                ct = pd.crosstab(input_df[c1].astype(str), input_df[c2].astype(str))
+                st.markdown(
+                    f"**Value-pair counts for `{c1}` × `{c2}`** "
+                    f"(flagged combination: {vals[0]} / {vals[1]})"
+                )
+                st.dataframe(ct, use_container_width=True)
+                shown += 1
+
+
+def _render_baseline_section(res: dict) -> None:
+    baseline = res.get("baseline_flags")
+    if baseline is None:
+        return
+    scores = res["scores"]
+    cod_flags = (pd.Series(scores).fillna(0).to_numpy() > 0)
+    base_flags = np.asarray(baseline, dtype=bool)
+    if len(base_flags) != len(cod_flags):
+        return
+
+    st.markdown("### Baseline cross-check (IsolationForest)")
+    both = cod_flags & base_flags
+    cols = st.columns(3)
+    with cols[0]:
+        _metric_card("Flagged by both", f"{int(both.sum()):,}")
+    with cols[1]:
+        _metric_card("Counts detector only", f"{int((cod_flags & ~base_flags).sum()):,}")
+    with cols[2]:
+        _metric_card("IsolationForest only", f"{int((base_flags & ~cod_flags).sum()):,}")
+    st.caption(
+        "Rows flagged by both methods are high-confidence outliers; rows flagged "
+        "only by the counts detector come with explanations you can review above."
+    )
+    input_df = res["input_df"]
+    if both.any() and isinstance(input_df, pd.DataFrame) and len(input_df) == len(both):
+        with st.expander("High-confidence rows (flagged by both)"):
+            st.dataframe(input_df[both], use_container_width=True)
+
+
 def page_results():
     st.header("5 · Results", anchor=False)
 
@@ -566,8 +832,10 @@ def page_results():
         return
 
     cols = st.columns(4)
-    scores = res["scores"]
+    scores = pd.Series(res["scores"]).fillna(0)
     flagged_count = int((scores > 0).sum())
+    max_score = scores.max() if len(scores) else 0
+    top_score = int(max_score) if pd.notna(max_score) else 0
     with cols[0]:
         _metric_card("Rows analysed", f"{len(res['input_df']):,}")
     with cols[1]:
@@ -575,7 +843,7 @@ def page_results():
     with cols[2]:
         _metric_card("Flagged %", f"{flagged_count/max(len(scores),1)*100:.2f}%")
     with cols[3]:
-        _metric_card("Top score", f"{int(scores.max() or 0)}")
+        _metric_card("Top score", f"{top_score}")
 
     st.markdown("### Score distribution")
     st.altair_chart(_altair_score_distribution(scores), use_container_width=True)
@@ -586,6 +854,9 @@ def page_results():
         st.info("No rows were flagged with the current parameters.")
     else:
         st.dataframe(most, use_container_width=True)
+
+    _render_row_inspector(res)
+    _render_baseline_section(res)
 
     with st.expander("Detector summary"):
         st.code(res["run_summary"] or "(no summary)", language="text")
@@ -617,7 +888,7 @@ def page_results():
         except Exception as exc:
             st.error(f"Export failed: {exc}")
         else:
-            label_safe = (res["label"] or "results").replace(" ", "_")
+            label_safe = safe_filename(res["label"])
             st.download_button(
                 f"Download {target.lower()} ({fmt})",
                 data=data, mime=mime,
@@ -625,13 +896,29 @@ def page_results():
                 type="primary",
             )
 
+    st.markdown("### Audit report")
+    st.caption("A single, self-contained HTML file with parameters, charts, flagged "
+               "rows and explanations — ready to share or archive.")
+    if st.button("Generate HTML report"):
+        try:
+            st.session_state.report_html = build_html_report(res)
+        except Exception as exc:
+            st.error(f"Report generation failed: {exc}")
+    if st.session_state.report_html:
+        st.download_button(
+            "Download HTML report",
+            data=st.session_state.report_html.encode("utf-8"),
+            mime="text/html",
+            file_name=f"{safe_filename(res['label'])}_report.html",
+        )
+
     st.markdown("---")
     with st.expander("Run history"):
         history_picker(load_into_state=True)
 
 
 def history_picker(load_into_state: bool = False):
-    runs = db.list_runs()
+    runs = _runs_catalogue()
     if runs.empty:
         st.info("No runs saved yet.")
         return
@@ -655,6 +942,7 @@ def history_picker(load_into_state: bool = False):
         except KeyError:
             input_df = pd.DataFrame()
 
+        st.session_state.report_html = None
         st.session_state.last_results = {
             "label": run["label"],
             "input_df": input_df,
@@ -667,26 +955,126 @@ def history_picker(load_into_state: bool = False):
                 flagged_all.sort_values("TOTAL SCORE", ascending=False)
                 if "TOTAL SCORE" in flagged_all.columns else flagged_all
             ),
+            "baseline_flags": None,
             "run_summary": run["run_summary"],
             "params": run["params"],
         }
         st.success(f"Loaded run {rid}")
         st.rerun()
-    if col_b.button("Delete run", key="del_run"):
-        db.delete_run(int(rid))
-        st.success(f"Deleted run {rid}")
-        st.rerun()
+    with col_b:
+        confirm_run = st.checkbox("Confirm deletion", key="confirm_run_delete")
+        if st.button("Delete run", key="del_run", disabled=not confirm_run):
+            db.delete_run(int(rid))
+            _invalidate_catalogues()
+            st.success(f"Deleted run {rid}")
+            st.rerun()
+
+
+def _render_run_comparison():
+    st.subheader("Compare two runs")
+    runs = _runs_catalogue()
+    if len(runs) < 2:
+        st.info("Save at least two runs to compare them.")
+        return
+    ids = runs["id"].tolist()
+
+    def _fmt(i):
+        row = runs.loc[runs["id"] == i].iloc[0]
+        return f"#{i} · {row['label']} ({row['dataset_name']})"
+
+    col_a, col_b = st.columns(2)
+    run_a = col_a.selectbox("Run A", ids, index=0, key="cmp_a", format_func=_fmt)
+    run_b = col_b.selectbox("Run B", ids, index=1, key="cmp_b", format_func=_fmt)
+
+    if not st.button("Compare", key="cmp_btn"):
+        return
+    if run_a == run_b:
+        st.warning("Pick two different runs.")
+        return
+
+    ra, rb = db.load_run(int(run_a)), db.load_run(int(run_b))
+    if ra["dataset_id"] != rb["dataset_id"]:
+        st.warning("These runs used different datasets — the row-level comparison "
+                   "below matches rows by position and may not be meaningful.")
+
+    fa, fb = _flag_array(ra["results"]), _flag_array(rb["results"])
+    n = min(len(fa), len(fb))
+    if len(fa) != len(fb):
+        st.warning(f"The runs cover different row counts ({len(fa)} vs {len(fb)}); "
+                   f"comparing the first {n} rows.")
+    fa, fb = fa[:n], fb[:n]
+
+    cols = st.columns(3)
+    with cols[0]:
+        _metric_card("Flagged in both", f"{int((fa & fb).sum()):,}")
+    with cols[1]:
+        _metric_card("Only in A", f"{int((fa & ~fb).sum()):,}")
+    with cols[2]:
+        _metric_card("Only in B", f"{int((fb & ~fa).sum()):,}")
+
+    params_df = pd.DataFrame({
+        "Parameter": sorted(set(ra["params"]) | set(rb["params"])),
+    })
+    params_df["Run A"] = params_df["Parameter"].map(lambda k: str(ra["params"].get(k, "—")))
+    params_df["Run B"] = params_df["Parameter"].map(lambda k: str(rb["params"].get(k, "—")))
+    with st.expander("Parameter comparison"):
+        st.dataframe(params_df, use_container_width=True, hide_index=True)
+
+    diff_positions = np.flatnonzero(fa != fb)
+    if len(diff_positions) == 0:
+        st.success("The two runs flagged exactly the same rows.")
+        return
+    diff_df = pd.DataFrame({
+        "row": diff_positions,
+        "flagged in A": fa[diff_positions],
+        "flagged in B": fb[diff_positions],
+    })
+    try:
+        dataset = db.load_dataset(ra["dataset_id"])
+        in_range = diff_positions[diff_positions < len(dataset)]
+        diff_df = diff_df.merge(
+            dataset.iloc[in_range].reset_index(drop=True).assign(row=in_range),
+            on="row", how="left",
+        )
+    except KeyError:
+        pass
+    st.markdown("**Rows flagged by one run but not the other**")
+    st.dataframe(diff_df.head(200), use_container_width=True, hide_index=True)
 
 
 def page_history():
     st.header("History", anchor=False)
     st.caption("All datasets and analyses persisted to the local SQLite database.")
     st.subheader("Datasets")
-    st.dataframe(db.list_datasets(), use_container_width=True, hide_index=True)
+    st.dataframe(_datasets_catalogue(), use_container_width=True, hide_index=True)
     st.subheader("Runs")
-    st.dataframe(db.list_runs(), use_container_width=True, hide_index=True)
+    st.dataframe(_runs_catalogue(), use_container_width=True, hide_index=True)
     st.markdown("---")
     history_picker(load_into_state=True)
+
+    st.markdown("---")
+    _render_run_comparison()
+
+    st.markdown("---")
+    st.subheader("Maintenance")
+    st.caption(f"Database file: `{db.DEFAULT_DB_PATH}`")
+    col_v, col_p = st.columns(2)
+    with col_v:
+        if st.button("Vacuum database",
+                     help="Reclaims disk space so deleted data no longer lingers "
+                          "in the file."):
+            db.vacuum()
+            st.success("Database vacuumed.")
+    with col_p:
+        confirm_purge = st.checkbox(
+            "I understand this deletes ALL stored datasets and runs",
+            key="confirm_purge",
+        )
+        if st.button("Purge all data", disabled=not confirm_purge):
+            db.purge_all()
+            _invalidate_catalogues()
+            st.success("All stored data deleted and database vacuumed.")
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------

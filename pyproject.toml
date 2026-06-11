@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "counts-outlier-detector"
+version = "0.2.0"
+description = "Multidimensional, interpretable outlier detection for tabular data based on the rarity of value combinations."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["outlier-detection", "anomaly-detection", "interpretability", "tabular-data"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+# The detector library itself only needs the scientific stack.
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+# The Streamlit Studio app on top of the library.
+studio = [
+    "streamlit>=1.32",
+    "altair>=5.0",
+    "matplotlib>=3.7",
+    "seaborn>=0.13",
+    "openpyxl>=3.1",
+    "pyarrow>=14.0",
+]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "pandas-stubs>=2.0",
+]
+
+[tool.setuptools]
+packages = ["counts_outlier_detector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+# Defaults (pyflakes + a pycodestyle subset); E501 intentionally not enabled
+# because the detector's inner loops carry long pruning conditions.
+select = ["E4", "E7", "E9", "F", "W"]
+ignore = [
+    "E701",  # multiple statements on one line — used deliberately in the hot loops
+]
+
+[tool.ruff.lint.per-file-ignores]
+# ui.py must adjust sys.path before importing the app package;
+# report.py must call matplotlib.use("Agg") before importing pyplot.
+"app/ui.py" = ["E402"]
+"app/report.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+exclude = []

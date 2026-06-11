@@ -5,7 +5,7 @@ __pycache__/
 venv/
 .env
 *.egg-info/
-.streamlit/
+.streamlit/secrets.toml
 .idea/
 .vscode/
 .DS_Store

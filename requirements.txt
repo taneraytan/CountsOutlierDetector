@@ -1,3 +1,5 @@
+# Direct dependencies (floor pins). For reproducible installs use the fully
+# pinned lockfile instead:  pip install -r requirements.lock
 streamlit>=1.32
 pandas>=2.0
 numpy>=1.24
@@ -6,5 +8,4 @@ matplotlib>=3.7
 seaborn>=0.13
 altair>=5.0
 openpyxl>=3.1
-xlrd>=2.0
 pyarrow>=14.0
